@@ -1,111 +1,160 @@
+from __future__ import annotations
+
+import os
+import tempfile
+from pathlib import Path
+from io import BytesIO
+
+import cv2
+import numpy as np
 import streamlit as st
-import time
-import random
+import torch
 from PIL import Image
-import io
+
+from verifai.agents import (
+    AdversarialAssessmentAgent,
+    DecisionVerificationAgent,
+    FeatureExtractionAgent,
+    InputQualityAgent,
+    ModelSelectionAgent,
+)
+from verifai.models import ModelRegistry
+
 
 st.set_page_config(page_title="VERIFAI", layout="centered")
-
-st.title("🔍 VERIFAI")
-st.subheader("Agentic Deepfake Detection & Authenticity Verification")
-
-st.markdown(
-    "An agentic AI system that verifies media authenticity by coordinating multiple forensic agents."
+st.title("VERIFAI")
+st.subheader("Adaptive Deepfake Detection & Adversarial Robustness")
+st.caption(
+    "Research prototype. Results depend on the model and data used to train it; "
+    "they are not proof of authenticity."
 )
 
-uploaded_file = st.file_uploader(
-    "Upload an image or video", type=["jpg", "png", "jpeg", "mp4"]
+MODEL_DIR = Path(os.environ.get("VERIFAI_MODELS_DIR", "models"))
+MAX_VIDEO_FRAMES = 8
+INPUT_SIZE = 224
+
+
+def load_media(upload) -> tuple[list[Image.Image], str]:
+    content = upload.getvalue()
+    if upload.type.startswith("image/"):
+        with Image.open(BytesIO(content)) as image:
+            return [image.convert("RGB")], "image"
+
+    suffix = Path(upload.name).suffix or ".mp4"
+    temporary_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
+            temporary.write(content)
+            temporary_path = temporary.name
+        capture = cv2.VideoCapture(temporary_path)
+        try:
+            if not capture.isOpened():
+                raise ValueError("Could not open this video. Check that its codec is supported.")
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count <= 0:
+                raise ValueError("The uploaded video contains no readable frames.")
+            indices = np.linspace(
+                0, frame_count - 1, min(MAX_VIDEO_FRAMES, frame_count), dtype=int
+            )
+            frames: list[Image.Image] = []
+            for index in np.unique(indices):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+                ok, frame = capture.read()
+                if ok:
+                    frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        finally:
+            capture.release()
+        if not frames:
+            raise ValueError("No video frames could be decoded.")
+        return frames, "video"
+    finally:
+        if temporary_path is not None:
+            Path(temporary_path).unlink(missing_ok=True)
+
+
+@st.cache_resource
+def get_registry(directory: str) -> ModelRegistry:
+    return ModelRegistry.from_directory(Path(directory))
+
+
+upload = st.file_uploader(
+    "Upload an image or video", type=["jpg", "jpeg", "png", "mp4", "mov", "avi", "webm"]
 )
 
-def simulate_delay(sec=1):
-    time.sleep(sec)
-
-def metadata_agent_safe(file):
-    if file.type.startswith("image"):
-        return {
-            "status": random.choice(["Suspicious"]),
-            "findings": ["EXIF partially missing", "Possible re-encoding"]
-        }
-    else:
-        return {
-            "status": "Suspicious",
-            "findings": ["Video metadata limited"]
-        }
-
-def visual_agent():
-    score = round(random.uniform(0.65, 0.92), 2)
-    artifacts = [
-        "Facial boundary distortion",
-        "Inconsistent lighting",
-        "Texture smoothing anomalies"
-    ]
-    return {
-        "fake_score": score,
-        "artifacts": random.sample(artifacts, k=2)
-    }
-
-def reasoning_agent(visual, metadata):
-    verdict = "Likely Deepfake"
-    score = random.randint(10, 30)
-    explanation = (
-        "Visual analysis detected facial artifacts commonly associated "
-        "with synthetic media. Metadata inspection revealed inconsistencies. "
-        "Combined evidence suggests manipulation."
+if not MODEL_DIR.exists() or not any(MODEL_DIR.glob("*.pt")):
+    st.warning(
+        f"No trained detector checkpoints found in `{MODEL_DIR}`. Train one with "
+        "`python train.py --train-dir data/train --val-dir data/val --output models/balanced.pt` "
+        "before requesting a verdict."
     )
-    return verdict, score, explanation
+    st.code("python train.py --help\npython evaluate.py --help", language="powershell")
 
-if uploaded_file:
-    st.success("File uploaded successfully")
+if upload is not None:
+    try:
+        frames, media_kind = load_media(upload)
+        if media_kind == "image":
+            st.image(frames[0], caption="Uploaded image", use_container_width=True)
+        else:
+            st.video(upload.getvalue())
+            st.caption(f"Analyzing {len(frames)} evenly sampled frames.")
 
-    if uploaded_file.type.startswith("image"):
-        img = Image.open(uploaded_file)
-        st.image(img, caption="Uploaded Image", use_column_width=True)
+        registry = get_registry(str(MODEL_DIR.resolve()))
+        quality_agent = InputQualityAgent()
+        quality_reports = [quality_agent.analyze(frame) for frame in frames]
+        quality = quality_agent.aggregate(quality_reports)
+        selector = ModelSelectionAgent()
+        selection = selector.select(registry, quality)
+        feature_report = FeatureExtractionAgent().analyze(frames, registry[selection.name])
+        all_probabilities: dict[str, list[float]] = {name: [] for name in registry.names}
 
-    st.markdown("---")
-    st.subheader("🧠 Agent Execution Log")
+        with st.spinner(f"Running `{selection.name}` and verification detectors..."):
+            for frame in frames:
+                tensor = quality_agent.to_tensor(frame, INPUT_SIZE)
+                for name, detector in registry.items():
+                    probability = detector.fake_probability(tensor)
+                    all_probabilities[name].append(probability)
 
-    with st.spinner("Preprocessing Agent running..."):
-        simulate_delay()
-        st.write("✔ Frames extracted")
-        st.write("✔ Metadata parsed")
-
-    with st.spinner("Visual Forensics Agent running..."):
-        simulate_delay()
-        visual_result = visual_agent()
-        st.write("✔ Visual artifacts analyzed")
-
-    with st.spinner("Metadata Agent running..."):
-        simulate_delay()
-        metadata_result = metadata_agent_safe(uploaded_file)
-        st.write("✔ Metadata inspection completed")
-
-    with st.spinner("Reasoning Agent aggregating evidence..."):
-        simulate_delay()
-        verdict, auth_score, explanation = reasoning_agent(
-            visual_result, metadata_result
+        st.subheader("Agent findings")
+        st.write(
+            f"**Input quality:** {quality.label} "
+            f"({quality.width}×{quality.height}, blur score {quality.blur_score:.1f})"
+        )
+        st.write(
+            f"**Adaptive selection:** `{selection.name}` — {selection.reason}"
+        )
+        st.write(
+            f"**Feature extraction:** {feature_report.dimensions}-dimensional embeddings; "
+            f"mean activation {feature_report.mean_activation:.3f}, "
+            f"frame variation {feature_report.frame_variation:.3f}"
         )
 
-    st.markdown("---")
-    st.subheader("📊 Agent Results")
+        mean_probabilities = {
+            name: float(np.mean(values)) for name, values in all_probabilities.items()
+        }
+        adversarial_report = AdversarialAssessmentAgent().assess(
+            frames, registry[selection.name], quality_agent
+        )
+        decision = DecisionVerificationAgent().verify(
+            mean_probabilities, adversarial_report.instability
+        )
+        st.write(
+            f"**Adversarial sensitivity:** {adversarial_report.label} "
+            f"(maximum probe shift {adversarial_report.instability:.1%})"
+        )
+        st.caption(adversarial_report.explanation)
 
-    col1, col2 = st.columns(2)
+        st.subheader("Detector scores")
+        for name, probability in mean_probabilities.items():
+            st.write(f"`{name}` — fake probability: **{probability:.1%}**")
 
-    with col1:
-        st.markdown("### 👁 Visual Forensics Agent")
-        st.write(f"Fake Probability: **{visual_result['fake_score']}**")
-        for a in visual_result["artifacts"]:
-            st.write(f"- {a}")
-
-    with col2:
-        st.markdown("### 🧾 Metadata Agent")
-        st.write(f"Status: **{metadata_result['status']}**")
-        for f in metadata_result["findings"]:
-            st.write(f"- {f}")
-
-    st.markdown("---")
-    st.subheader("🧠 Final Verdict")
-    st.markdown(f"### **{verdict}**")
-    st.write(f"Authenticity Score: **{auth_score}%**")
-    st.info(explanation)
-
-    st.caption("⚠️ MVP demo — evidence-based multi-agent analysis")
+        st.subheader("Verified decision")
+        if decision.verdict == "Inconclusive":
+            st.info(decision.explanation)
+        elif decision.verdict == "Likely deepfake":
+            st.warning(f"{decision.verdict} · confidence {decision.confidence:.1%}")
+            st.write(decision.explanation)
+        else:
+            st.success(f"{decision.verdict} · confidence {decision.confidence:.1%}")
+            st.write(decision.explanation)
+    except (OSError, ValueError, RuntimeError) as error:
+        st.error(f"Analysis could not be completed: {error}")

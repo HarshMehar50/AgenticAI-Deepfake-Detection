@@ -1,0 +1,1 @@
+"""Adaptive deepfake detection prototype."""
